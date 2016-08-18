@@ -32,6 +32,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"gopkg.in/yaml.v2"
 )
@@ -42,13 +43,12 @@ const (
 )
 
 var (
-	// ErrInteractionNotFound indicates that a requested
-	// interaction was not found in the cassette file
-	ErrInteractionNotFound = errors.New("Requested interaction not found")
+	InteractionNotFound         = errors.New("Requested interaction not found")
+	matcher             Matcher = &DefaultMatcher{}
+	matcherMu           sync.Mutex
 )
 
-// Request represents a client request as recorded in the
-// cassette file
+// Client request type
 type Request struct {
 	// Body of request
 	Body string `yaml:"body"`
@@ -66,8 +66,7 @@ type Request struct {
 	Method string `yaml:"method"`
 }
 
-// Response represents a server response as recorded in the
-// cassette file
+// Server response type
 type Response struct {
 	// Body of response
 	Body string `yaml:"body"`
@@ -89,17 +88,6 @@ type Interaction struct {
 	Response `yaml:"response"`
 }
 
-// Matcher function returns true when the actual request matches
-// a single HTTP interaction's request according to the function's
-// own criteria.
-type Matcher func(*http.Request, Request) bool
-
-// Default Matcher is used when a custom matcher is not defined
-// and compares only the method and URL.
-func DefaultMatcher(r *http.Request, i Request) bool {
-	return r.Method == i.Method && r.URL.String() == i.URL
-}
-
 // Cassette type
 type Cassette struct {
 	// Name of the cassette
@@ -114,24 +102,30 @@ type Cassette struct {
 	// Interactions between client and server
 	Interactions []*Interaction `yaml:"interactions"`
 
-	// Matches actual request with interaction requests.
-	Matcher Matcher `yaml:"-"`
+	// Interactions mutex
+	InteractionsMu sync.Mutex `yaml:"-"`
+
+	// Unfinished requests mutex
+	UnfinishedRequests sync.RWMutex `yaml:"-"`
+
+	// Closed by client or hanging requests
+	UnclosedRequests map[string]interface{} `yaml:"unclosed_requests"`
 }
 
-// New creates a new empty cassette
+// Creates a new empty cassette
 func New(name string) *Cassette {
 	c := &Cassette{
-		Name:         name,
-		File:         fmt.Sprintf("%s.yaml", name),
-		Version:      cassetteFormatV1,
-		Interactions: make([]*Interaction, 0),
-		Matcher:      DefaultMatcher,
+		Name:             name,
+		File:             fmt.Sprintf("%s.yaml", name),
+		Version:          cassetteFormatV1,
+		Interactions:     make([]*Interaction, 0),
+		UnclosedRequests: make(map[string]interface{}),
 	}
 
 	return c
 }
 
-// Load reads a cassette file from disk
+// Loads a cassette file from disk
 func Load(name string) (*Cassette, error) {
 	c := New(name)
 	data, err := ioutil.ReadFile(c.File)
@@ -144,23 +138,30 @@ func Load(name string) (*Cassette, error) {
 	return c, err
 }
 
-// AddInteraction appends a new interaction to the cassette
+// Adds a new interaction to the cassette
 func (c *Cassette) AddInteraction(i *Interaction) {
+	c.InteractionsMu.Lock()
+	defer c.InteractionsMu.Unlock()
 	c.Interactions = append(c.Interactions, i)
 }
 
-// GetInteraction retrieves a recorded request/response interaction
+// Gets a recorded interaction
 func (c *Cassette) GetInteraction(r *http.Request) (*Interaction, error) {
-	for _, i := range c.Interactions {
-		if c.Matcher(r, i.Request) {
-			return i, nil
-		}
-	}
-
-	return nil, ErrInteractionNotFound
+	c.InteractionsMu.Lock()
+	defer c.InteractionsMu.Unlock()
+	matcherMu.Lock()
+	defer matcherMu.Unlock()
+	return matcher.Match(c.Interactions, r)
 }
 
-// Save writes the cassette data on disk for future re-use
+// Custom matcher setter
+func (c *Cassette) SetMatcher(m Matcher) {
+	matcherMu.Lock()
+	defer matcherMu.Unlock()
+	matcher = m
+}
+
+// Saves the cassette on disk for future re-use
 func (c *Cassette) Save() error {
 	// Save cassette file only if there were any interactions made
 	if len(c.Interactions) == 0 {
@@ -176,7 +177,9 @@ func (c *Cassette) Save() error {
 	}
 
 	// Marshal to YAML and save interactions
+	c.UnfinishedRequests.RLock()
 	data, err := yaml.Marshal(c)
+	c.UnfinishedRequests.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -199,4 +202,46 @@ func (c *Cassette) Save() error {
 	}
 
 	return nil
+}
+
+// TODO: Rename unfinished requests
+// TODO: Fix RequestSaRted type
+// TODO: Make UR fields private
+// TODO: Create customizable url2url matcher
+
+func (c *Cassette) RequestStated(url string) {
+	c.UnfinishedRequests.Lock()
+	defer c.UnfinishedRequests.Unlock()
+	c.UnclosedRequests[url] = struct{}{}
+}
+
+func (c *Cassette) RequestFinished(url string) {
+	c.UnfinishedRequests.Lock()
+	defer c.UnfinishedRequests.Unlock()
+	delete(c.UnclosedRequests, url)
+}
+
+func (c *Cassette) HasRequest(url string) bool {
+	c.UnfinishedRequests.RLock()
+	defer c.UnfinishedRequests.RUnlock()
+	matcherMu.Lock()
+	defer matcherMu.Unlock()
+
+	for k, _ := range c.UnclosedRequests {
+		if matcher.MatchUrlStrings(url, k) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (c *Cassette) Requests() []string {
+	var requests []string
+
+	for k, _ := range c.UnclosedRequests {
+		requests = append(requests, k)
+	}
+
+	return requests
 }

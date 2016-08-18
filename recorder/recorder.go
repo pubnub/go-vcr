@@ -1,5 +1,4 @@
-// Copyright (c) 2015-2016 Marin Atanasov Nikolov <dnaeon@gmail.com>
-// Copyright (c) 2016 David Jack <davars@gmail.com>
+// Copyright (c) 2015 Marin Atanasov Nikolov <dnaeon@gmail.com>
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -29,45 +28,57 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"io"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httputil"
+	"net/url"
 	"os"
+	"strings"
+	"sync"
+	"time"
 
-	"github.com/dnaeon/go-vcr/cassette"
+	"github.com/pubnub/go-vcr/cassette"
 )
+
+type RecorderMode int
 
 // Recorder states
 const (
-	ModeRecording = iota
+	ModeRecording RecorderMode = iota
 	ModeReplaying
 )
 
-// Recorder represents a type used to record and replay
-// client and server interactions
 type Recorder struct {
 	// Operating mode of the recorder
-	mode int
+	mode RecorderMode
+
+	// HTTP server used to mock requests
+	server *httptest.Server
 
 	// Cassette used by the recorder
 	cassette *cassette.Cassette
 
 	// Transport that can be used by clients to inject
-	Transport *Transport
-}
+	Transport *http.Transport
 
-// SetClient can be used to configure the behavior of the 'real' client used in record-mode
-func (r *Recorder) SetClient(client *http.Client) {
-	r.Transport.client = client
+	stopMu    sync.Mutex
+	matcherMu sync.Mutex
+
+	wg *sync.WaitGroup
 }
 
 // Proxies client requests to their original destination
-func requestHandler(r *http.Request, c *cassette.Cassette, mode int, client *http.Client) (*cassette.Interaction, error) {
+func requestHandler(r *http.Request, c *cassette.Cassette, mode RecorderMode) (
+	*cassette.Interaction, error) {
+
 	// Return interaction from cassette if in replay mode
 	if mode == ModeReplaying {
 		return c.GetInteraction(r)
 	}
+
+	c.RequestStated(r.URL.String())
 
 	// Copy the original request, so we can read the form values
 	reqBytes, err := httputil.DumpRequestOut(r, true)
@@ -86,15 +97,22 @@ func requestHandler(r *http.Request, c *cassette.Cassette, mode int, client *htt
 		return nil, err
 	}
 
-	reqBody := &bytes.Buffer{}
-	if r.Body != nil {
-		// Record the request body so we can add it to the cassette
-		r.Body = ioutil.NopCloser(io.TeeReader(r.Body, reqBody))
-	}
-
 	// Perform client request to it's original
 	// destination and record interactions
-	resp, err := client.Do(r)
+	body := ioutil.NopCloser(r.Body)
+	req, err := http.NewRequest(r.Method, r.URL.String(), body)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header = r.Header
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+
+	// Record the interaction and add it to the cassette
+	reqBody, err := ioutil.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -103,15 +121,16 @@ func requestHandler(r *http.Request, c *cassette.Cassette, mode int, client *htt
 	if err != nil {
 		return nil, err
 	}
+	c.RequestFinished(r.URL.String())
 
 	// Add interaction to cassette
 	interaction := &cassette.Interaction{
 		Request: cassette.Request{
-			Body:    reqBody.String(),
+			Body:    string(reqBody),
 			Form:    copiedReq.PostForm,
-			Headers: r.Header,
-			URL:     r.URL.String(),
-			Method:  r.Method,
+			Headers: req.Header,
+			URL:     req.URL.String(),
+			Method:  req.Method,
 		},
 		Response: cassette.Response{
 			Body:    string(respBody),
@@ -125,10 +144,11 @@ func requestHandler(r *http.Request, c *cassette.Cassette, mode int, client *htt
 	return interaction, nil
 }
 
-// New creates a new recorder
+// Creates a new recorder
 func New(cassetteName string) (*Recorder, error) {
-	var mode int
+	var mode RecorderMode
 	var c *cassette.Cassette
+	var wg sync.WaitGroup
 	cassetteFile := fmt.Sprintf("%s.yaml", cassetteName)
 
 	// Depending on whether the cassette file exists or not we
@@ -144,24 +164,118 @@ func New(cassetteName string) (*Recorder, error) {
 			return nil, err
 		}
 		mode = ModeReplaying
+		wg.Add(len(c.UnclosedRequests))
+	}
+
+	rec := &Recorder{
+		mode:     mode,
+		cassette: c,
+		wg:       &wg,
+	}
+
+	doneRequests := make(map[string]struct{})
+	var doneRequestMu sync.RWMutex
+
+	// Handler for client requests
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
+		if rec.mode == ModeReplaying && c.HasRequest(r.URL.String()) {
+			doneRequestMu.RLock()
+			_, duplicate := doneRequests[r.URL.String()]
+			doneRequestMu.RUnlock()
+
+			if duplicate != true {
+				doneRequestMu.Lock()
+				doneRequests[r.URL.String()] = struct{}{}
+				doneRequestMu.Unlock()
+			}
+
+			cn, ok := w.(http.CloseNotifier)
+			if !ok {
+				log.Fatal("don't support CloseNotifier")
+			}
+
+			<-cn.CloseNotify()
+			if duplicate != true {
+				wg.Done()
+			}
+
+			return
+		}
+
+		interaction, err := requestHandler(r, c, mode)
+
+		if err != nil {
+			panic(fmt.Errorf("Failed to process request for URL:\n%s\n%s", r.URL, err))
+		}
+
+		w.WriteHeader(interaction.Response.Code)
+		body := strings.TrimSuffix(interaction.Response.Body, "\n")
+		fmt.Fprintln(w, body)
+	})
+
+	// HTTP server used to mock requests
+	rec.server = httptest.NewServer(handler)
+
+	// A proxy function which routes all requests through our HTTP server
+	// Can be used by clients to inject into their own transports
+	proxyUrl, err := url.Parse(rec.server.URL)
+	if err != nil {
+		return nil, err
 	}
 
 	// A transport which can be used by clients to inject
-	transport := &Transport{c: c, mode: mode}
-
-	r := &Recorder{
-		mode:      mode,
-		cassette:  c,
-		Transport: transport,
+	rec.Transport = &http.Transport{
+		Proxy: http.ProxyURL(proxyUrl),
 	}
 
-	r.SetClient(http.DefaultClient)
-
-	return r, nil
+	return rec, nil
 }
 
-// Stop is used to stop the recorder and save any recorded interactions
+// Setter for custom matcher
+func (r *Recorder) UseMatcher(matcher cassette.Matcher) {
+	r.cassette.SetMatcher(matcher)
+}
+
+// Recorder mode getter
+func (r *Recorder) Mode() RecorderMode {
+	return r.mode
+}
+
+type keepAliveServer interface {
+	SetKeepAlivesEnabled(bool)
+}
+
+// Stops the recorder
 func (r *Recorder) Stop() error {
+	if r.mode == ModeReplaying {
+		waitChannel := make(chan struct{})
+
+		go func() {
+			r.wg.Wait()
+			waitChannel <- struct{}{}
+		}()
+
+		select {
+		case <-waitChannel:
+		case <-time.After(5 * time.Second):
+			// Extra subscribe calls dosne't invoked, and it's ok
+		}
+	}
+
+	r.stopMu.Lock()
+	r.server.Listener.Close()
+
+	var srv interface{}
+	srv = r.server.Config
+	if s, ok := srv.(keepAliveServer); ok {
+		s.SetKeepAlivesEnabled(false)
+	}
+
+	r.server.CloseClientConnections()
+	r.Transport = nil
+	r.stopMu.Unlock()
+
 	if r.mode == ModeRecording {
 		if err := r.cassette.Save(); err != nil {
 			return err
@@ -169,47 +283,4 @@ func (r *Recorder) Stop() error {
 	}
 
 	return nil
-}
-
-// Transport either records or replays responses from a cassette, depending on its mode
-type Transport struct {
-	c      *cassette.Cassette
-	mode   int
-	client *http.Client
-}
-
-// RoundTrip implements the http.RoundTripper interface
-func (t *Transport) RoundTrip(r *http.Request) (*http.Response, error) {
-	// Pass cassette and mode to handler, so that interactions can be
-	// retrieved or recorded depending on the current recorder mode
-	interaction, err := requestHandler(r, t.c, t.mode, t.client)
-
-	if err != nil {
-		return nil, err
-	}
-
-	buf := bytes.NewBuffer([]byte(interaction.Response.Body))
-
-	return &http.Response{
-		Status:        interaction.Response.Status,
-		StatusCode:    interaction.Response.Code,
-		Proto:         "HTTP/1.0",
-		ProtoMajor:    1,
-		ProtoMinor:    0,
-		Request:       r,
-		Header:        interaction.Response.Headers,
-		Close:         true,
-		ContentLength: int64(buf.Len()),
-		Body:          ioutil.NopCloser(buf),
-	}, nil
-}
-
-// CancelRequest implements the github.com/coreos/etcd/client.CancelableTransport interface
-func (t *Transport) CancelRequest(req *http.Request) {
-	// noop
-}
-
-// SetMatcher sets a function to match requests against recorded HTTP interactions.
-func (r *Recorder) SetMatcher(matcher cassette.Matcher) {
-	r.cassette.Matcher = matcher
 }
